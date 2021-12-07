@@ -1,0 +1,283 @@
+- name: GKE Backup Configuration
+  hosts: localhost
+  gather_facts: no
+  connection: local
+
+  vars_files:
+    - ../gcp_ddve-ppdm/gcp_tf_ddve-ppdm_ansible_vars_file.yaml
+    # or define PPDM and DDVE related variables manually in vars section
+    - ./gcp_tf_k8s_ansible_vars_file.yaml
+
+  vars:
+    PPDM_IP: "{{ tf_ppdm_external_ip }}"
+    URI_2: https://{{ PPDM_IP }}:8443/api/v2
+    PPDM_USER: "admin"
+    PPDM_PASSWORD: "{{ tf_ppdm_common_password }}"
+    K8S_HOSTNAME: "{{ tf_gke_cluster_name }}"
+    K8S_ENDPOINT: "{{ tf_gke_cluster_endpoint }}"
+    K8S_BACKUPADMIN: "{{ gke_backupadmin_name }}"
+    K8S_BACKUPADMIN_TOKEN: "{{ gke_backupadmin_token }}"
+    DDVE_INTERNAL_IP: "{{ tf_ddve_internal_ip }}"
+    K8S_PROTECTIONPOLICY: "{{ tf_gke_cluster_name }}-backup-policy-01"
+    K8S_DEMONAMESPACE: "{{ gke_demonamespace_name }}"
+
+  tasks:
+  - name: "Authenticate and get PPDM Token"
+    uri:
+      url: "{{ URI_2 }}/login"
+      method: POST
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      body:
+        username: "{{ PPDM_USER }}"
+        password: "{{ PPDM_PASSWORD }}"
+      status_code: 200
+    register: ppdmtoken
+
+  - name: "Get K8S Certificate"
+    uri:
+      url: "{{ URI_2 }}/certificates?host={{ K8S_ENDPOINT }}&port=443&type=Host"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: GET
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      status_code: 200
+    register: k8s_cert
+    until: k8s_cert.status == 200
+    retries: 90
+    delay: 10
+
+  - name: "Accept K8S certificate"
+    uri:
+      url: "{{ URI_2 }}/certificates/{{ k8s_cert.json[0].id }}"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: PUT
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      body: |
+          {
+            "fingerprint": "{{ k8s_cert.json[0].fingerprint }}",
+            "host": "{{ k8s_cert.json[0].host }}",
+            "id": "{{ k8s_cert.json[0].id }}",
+            "issuerName": "{{ k8s_cert.json[0].issuerName }}",
+            "notValidAfter": "{{ k8s_cert.json[0].notValidAfter }}",
+            "notValidBefore": "{{ k8s_cert.json[0].notValidBefore }}",
+            "port": "{{ k8s_cert.json[0].port }}",
+            "state": "ACCEPTED",
+            "subjectName": "{{ k8s_cert.json[0].subjectName }}",
+            "type": "{{ k8s_cert.json[0].type }}"
+          }
+      status_code: 200
+    register: accept_k8s_cert
+    until: accept_k8s_cert.status == 200
+    retries: 90
+    delay: 10
+
+  - name: "Create K8S credentials"
+    uri:
+      url: "{{ URI_2 }}/credentials"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: POST
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      body: |
+          {
+              "type": "KUBERNETES",
+              "username": "{{ K8S_BACKUPADMIN }}",
+              "password": "{{ K8S_BACKUPADMIN_TOKEN }}",
+              "name": "{{ K8S_BACKUPADMIN }}",
+              "method": "TOKEN"
+          }
+      status_code: [200,201,403]
+    register: k8s_creds
+    until: k8s_creds.status == 200 or k8s_creds.status == 201 or k8s_creds.status == 403
+    retries: 3
+    delay: 10
+
+  - name: "Add K8S cluster"
+    uri:
+      url: "{{ URI_2 }}/inventory-sources"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: POST
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      body: |
+          {
+            "type": "KUBERNETES",
+            "name": "{{ K8S_HOSTNAME }}",
+            "port": 443,
+            "credentials": {
+              "id": "{{ k8s_creds.json.id }}"
+            },
+            "address": "{{ K8S_ENDPOINT }}"
+          }
+      status_code: 201
+    register: k8s
+
+  - name: Pause for 5 mins while discovery is running
+    pause:
+      minutes: 5
+
+  - name: "Get DD Storage Systems"
+    uri:
+      url: "{{ URI_2 }}/storage-systems"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: GET
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      status_code: 200
+    register: stgsys
+
+  - name: "Get DD Credentials"
+    uri:
+      url: "{{ URI_2 }}/credentials?filter=name%20eq%20%22SYSADMIN%22"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: GET
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      status_code: 200
+    register: ddcred
+
+  - name: "Generate a UUID"
+    shell: uuidgen
+    register: uuid
+
+  - name: "Add K8S ProtectionPolicy"
+    uri:
+      url: "{{ URI_2 }}/protection-policies"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: POST
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      body: |
+          {
+            "name": "{{ K8S_PROTECTIONPOLICY }}",
+            "description": "",
+            "assetType": "KUBERNETES",
+            "type": "ACTIVE",
+            "enabled": true,
+            "category": "CENTRALIZED_PROTECTION",
+            "dataConsistency": "CRASH_CONSISTENT",
+            "priority": 1,
+            "encrypted": false,
+            "stages": [
+              {
+                "id": "{{ uuid.stdout }}",
+                "type": "PROTECTION",
+                "passive": false,
+                "retention": {
+                  "interval": 7,
+                  "unit": "DAY",
+                  "storageSystemRetentionLock": false
+                },
+                "target": {
+                  "storageSystemId": "{{ stgsys.json.content[1].id }}"
+                },
+                "operations": [
+                  {
+                    "type": "AUTO_FULL",
+                    "schedule": {
+                      "frequency": "DAILY",
+                      "startTime": "2021-10-11T12:00:00Z",
+                      "duration": "PT10H"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+      status_code: 201
+    register: k8spp
+
+  - name: "Get Asset ID"
+    uri:
+      url: "{{ URI_2 }}/assets?filter=name%20eq%20%22{{ K8S_DEMONAMESPACE }}%22"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: GET
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      status_code: 200
+    register: demoid
+
+  - name: "Add Demo namespace to the ProtectPolicy"
+    uri:
+      url: "{{ URI_2 }}/protection-policies/{{k8spp.json.id}}/asset-assignments"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: POST
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      body: [ "{{ demoid.json.content[0].id }}" ]
+      status_code: 204
+    register: demoassigned
+
+  - name: "Run Demo namespace backup"
+    uri:
+      url: "{{ URI_2 }}/protection-policies/{{ k8spp.json.id }}/backups"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: POST
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      body: |
+          {
+            "retention": {
+              "interval": 7,
+              "unit": "DAY"
+            }
+          }
+      status_code: 204
+    register: demorun
+
+  - name: "Enable K8S AssetSource in GUI"
+    uri:
+      url: "{{ URI_2 }}/common-settings/ASSET_SETTING"
+      headers:
+        Authorization: "Bearer {{ ppdmtoken.json.access_token }}"
+        Content-Type: "application/json"
+      method: PUT
+      validate_certs: no
+      return_content: yes
+      body_format: json
+      body: |
+          {
+            "id": "ASSET_SETTING",
+            "properties": [
+              {
+                "name": "enabledAssetTypes",
+                "type": "LIST",
+                "value": "KUBERNETES"
+              }
+            ]
+          }
+      status_code: 200
+    register: enablek8ssource
