@@ -1,6 +1,7 @@
 # Terraform-GKE-PPDM
 
 **Objective**: Provision GKE cluster and configure it for PPDM backup
+(currently, GKE and PPDM assumed to be in same network. Otherwise, VPC Network peering is required to be added in.)
 
 **Prerequisite**: This is setup and tested on a CentOS VM with following installed
 1. GCP SDK
